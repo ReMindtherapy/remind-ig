@@ -14,13 +14,23 @@ it would end up in git.
 Output is JSON on stdout: account, this week's posts, a baseline of older posts,
 and totals for both. Claude reads that and writes the brief.
 """
-import json, sys, urllib.error, urllib.parse, urllib.request
+import json, os, sys, urllib.error, urllib.parse, urllib.request
 from datetime import datetime, timedelta
 
 BASE = "https://graph.facebook.com/v21.0/"
 MEDIA_LIMIT = 50          # plenty for a young account
 WEEK_DAYS = 7
 BASELINE_DAYS = 180
+
+# PINNED. @remind.abad. We read this account and no other.
+#
+# This used to discover the account by walking me/accounts and taking whatever
+# Instagram account came back. That failed on the very first live run: the Page
+# was correctly linked, but the me/accounts edge is cached and served a stale
+# response with no instagram_business_account for a while afterwards. Asking for
+# the account we actually want avoids that edge entirely, and means we can never
+# silently read some other account either.
+IG_ID = os.environ.get("IG_ID", "17841434173646667")
 
 
 def api(path, **params):
@@ -47,26 +57,34 @@ def die(msg):
 
 
 def find_account():
-    r = api("me/accounts", limit=25,
-            fields="id,name,instagram_business_account"
-                   "{id,username,followers_count,media_count}")
-    if "ERR" in r:
-        die("Could not reach the Instagram API: %s. Most likely the token has "
-            "expired — see README.md, 'Every 60 days'." % r["ERR"])
+    """Read the pinned account directly. No discovery, no guessing."""
+    r = api(IG_ID, fields="id,username,followers_count,media_count")
 
-    found = []
-    for page in r.get("data", []):
-        ig = page.get("instagram_business_account")
-        if ig:
-            found.append({"page": page.get("name"), "ig_id": ig["id"],
-                          "username": ig.get("username"),
-                          "followers": ig.get("followers_count"),
-                          "media_count": ig.get("media_count")})
-    if not found:
-        die("The token works but no Instagram Business account is linked to any "
-            "Page. Check that the Instagram account is set to Business or Creator "
-            "and is connected to the ReMind Facebook Page.")
-    return found[0]
+    if "ERR" in r:
+        # State what was observed; list causes by likelihood, transient first.
+        # Do NOT assert a single cause — an earlier version of this message
+        # blamed the Page link for what was actually a stale cached response,
+        # and cost an evening chasing a link that was already correct.
+        die("Could not read Instagram account %s. The request reached "
+            "graph.facebook.com and came back with: %s\n\n"
+            "In rough order of likelihood:\n"
+            "  1. A transient Meta error or a recently-changed setting that "
+            "hasn't propagated yet — wait a few minutes and re-run before "
+            "changing anything.\n"
+            "  2. The token has expired (they last ~60 days) — see README.md, "
+            "'Every 60 days'.\n"
+            "  3. The Instagram account is no longer linked to the ReMind "
+            "Facebook Page, or is no longer a Business/Creator account."
+            % (IG_ID, r["ERR"]))
+
+    if r.get("id") != str(IG_ID):
+        die("Asked for Instagram account %s but got back %r. Refusing to "
+            "report on an account we were not pointed at."
+            % (IG_ID, r.get("id")))
+
+    return {"ig_id": r["id"], "username": r.get("username"),
+            "followers": r.get("followers_count"),
+            "media_count": r.get("media_count")}
 
 
 def pull_posts(ig_id):
