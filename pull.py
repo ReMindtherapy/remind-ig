@@ -1,181 +1,84 @@
 """
-pull.py — fetch this week's Instagram numbers for ReMind and print them as JSON.
+pull.py — the weekly pull for ReMind. Prints JSON on stdout.
 
-Run it with no arguments:   python3 pull.py
+  python3 pull.py
 
-THERE IS NO ACCESS TOKEN IN THIS FILE, AND THERE MUST NEVER BE ONE.
+Claude reads that JSON, follows BRIEF.md, and writes the Monday brief.
 
-The token lives in the Claude cloud environment as an API credential. Anthropic's
-proxy adds the `Authorization: Bearer ...` header to every request to
-graph.facebook.com after it leaves the session, so this script sends no token and
-Claude never sees one. If you ever find yourself pasting a token in here, stop —
-it would end up in git.
+What it collects, and why each piece is here:
 
-Output is JSON on stdout: account, this week's posts, a baseline of older posts,
-and totals for both. Claude reads that and writes the brief.
+  account          who we are pinned to, follower count
+  activity         reach, PROFILE VIEWS and follows for the week. Profile views
+                   are the closest thing to intent the API gives us — reach with
+                   no profile views is the signature of the wrong audience.
+  audience         follower demographics vs ENGAGED audience demographics. This
+                   is the block that tells them whether Instagram is serving
+                   their Reels to the people they want to reach.
+  posts            per-post metrics and rates
+  comments         text, triaged into question / advance / abuse / praise, so
+                   unwanted contact is visible and countable rather than just
+                   felt.
+
+No access token appears in this repository. See README.md.
 """
-import json, os, sys, urllib.error, urllib.parse, urllib.request
-from datetime import datetime, timedelta
+import json, sys
+from datetime import datetime
 
-BASE = "https://graph.facebook.com/v21.0/"
-MEDIA_LIMIT = 50          # plenty for a young account
+import ig
+
 WEEK_DAYS = 7
 BASELINE_DAYS = 180
-
-# PINNED. @remind.abad. We read this account and no other.
-#
-# This used to discover the account by walking me/accounts and taking whatever
-# Instagram account came back. That failed on the very first live run: the Page
-# was correctly linked, but the me/accounts edge is cached and served a stale
-# response with no instagram_business_account for a while afterwards. Asking for
-# the account we actually want avoids that edge entirely, and means we can never
-# silently read some other account either.
-IG_ID = os.environ.get("IG_ID", "17841434173646667")
-
-
-def api(path, **params):
-    url = BASE + path
-    if params:
-        url += "?" + urllib.parse.urlencode(params)
-    try:
-        with urllib.request.urlopen(url, timeout=45) as r:
-            return json.loads(r.read())
-    except urllib.error.HTTPError as e:
-        try:
-            msg = json.loads(e.read()).get("error", {}).get("message", "?")
-        except Exception:
-            msg = "http %s" % e.code
-        return {"ERR": msg[:300]}
-    except Exception as e:
-        return {"ERR": str(e)[:300]}
-
-
-def die(msg):
-    """Fail loudly. A brief built from missing data is worse than no brief."""
-    print(json.dumps({"error": msg}, indent=1))
-    sys.exit(1)
-
-
-def find_account():
-    """Read the pinned account directly. No discovery, no guessing."""
-    r = api(IG_ID, fields="id,username,followers_count,media_count")
-
-    if "ERR" in r:
-        # State what was observed; list causes by likelihood, transient first.
-        # Do NOT assert a single cause — an earlier version of this message
-        # blamed the Page link for what was actually a stale cached response,
-        # and cost an evening chasing a link that was already correct.
-        die("Could not read Instagram account %s. The request reached "
-            "graph.facebook.com and came back with: %s\n\n"
-            "In rough order of likelihood:\n"
-            "  1. A transient Meta error or a recently-changed setting that "
-            "hasn't propagated yet — wait a few minutes and re-run before "
-            "changing anything.\n"
-            "  2. The token has expired (they last ~60 days) — see README.md, "
-            "'Every 60 days'.\n"
-            "  3. The Instagram account is no longer linked to the ReMind "
-            "Facebook Page, or is no longer a Business/Creator account."
-            % (IG_ID, r["ERR"]))
-
-    if r.get("id") != str(IG_ID):
-        die("Asked for Instagram account %s but got back %r. Refusing to "
-            "report on an account we were not pointed at."
-            % (IG_ID, r.get("id")))
-
-    return {"ig_id": r["id"], "username": r.get("username"),
-            "followers": r.get("followers_count"),
-            "media_count": r.get("media_count")}
-
-
-def pull_posts(ig_id):
-    m = api("%s/media" % ig_id, limit=MEDIA_LIMIT,
-            fields="id,caption,media_type,media_product_type,permalink,timestamp,"
-                   "like_count,comments_count")
-    if "ERR" in m:
-        die("Could not list posts: %s" % m["ERR"])
-
-    posts = []
-    for it in m.get("data", []):
-        cap = (it.get("caption") or "").replace("\n", " ").strip()
-        p = {"posted_at": it.get("timestamp"),
-             "type": it.get("media_product_type") or it.get("media_type"),
-             "permalink": it.get("permalink"),
-             "name": cap[:90] or "(no caption)",     # first line = the post's name
-             "caption": cap[:400],
-             "likes": it.get("like_count"),
-             "comments_count": it.get("comments_count")}
-
-        ins = api("%s/insights" % it["id"],
-                  metric="views,reach,likes,comments,shares,saved,total_interactions")
-        if "ERR" not in ins:
-            for x in ins.get("data", []):
-                try:
-                    p[x["name"]] = x["values"][0]["value"]
-                except Exception:
-                    pass
-
-        # The insights metric named "comments" is an int; keep it from being
-        # mistaken for a list of comment text further down the pipeline.
-        p["comment_interactions"] = p.pop("comments", None)
-
-        reach = p.get("reach") or 0
-        p["share_rate"] = round((p.get("shares") or 0) / reach, 4) if reach else None
-        p["save_rate"] = round((p.get("saved") or 0) / reach, 4) if reach else None
-        posts.append(p)
-    return posts
-
-
-def totals(posts):
-    if not posts:
-        return {"posts": 0}
-    tot = lambda k: sum(p.get(k) or 0 for p in posts)
-    reach = tot("reach")
-    return {"posts": len(posts), "reach": reach, "views": tot("views"),
-            "likes": tot("likes"), "shares": tot("shares"), "saves": tot("saved"),
-            "comments": tot("comments_count"),
-            "share_rate": round(tot("shares") / reach, 4) if reach else None,
-            "save_rate": round(tot("saved") / reach, 4) if reach else None,
-            "reach_per_post": round(reach / len(posts))}
+TREND_MIN_DAYS = 60       # account must be this old...
+TREND_MIN_POSTS = 8       # ...and have this many prior posts, to call a trend
 
 
 def main():
-    acct = find_account()
-    posts = pull_posts(acct["ig_id"])
-    if not posts:
-        die("No posts came back for @%s. If the account really has posted, this is "
-            "an API problem — do not report it as 'a quiet week'." % acct["username"])
+    payload = {"pulled_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+               "window_days": WEEK_DAYS, "baseline_days": BASELINE_DAYS}
 
-    now = datetime.utcnow()
-    week_start = now - timedelta(days=WEEK_DAYS)
-    base_start = now - timedelta(days=BASELINE_DAYS)
+    try:
+        acct = ig.account()
+    except ig.IGError as e:
+        print(json.dumps({"error": str(e)}, indent=1))
+        sys.exit(1)
+    payload["account"] = acct
 
-    def when(p):
-        try:
-            return datetime.strptime((p.get("posted_at") or "")[:19], "%Y-%m-%dT%H:%M:%S")
-        except Exception:
-            return None
+    payload["activity"] = ig.account_activity(payload, days=WEEK_DAYS)
+    payload["audience"] = ig.demographics(payload, timeframe="this_month")
 
-    this_week, baseline = [], []
-    for p in posts:
-        t = when(p)
-        if t and t >= week_start:
-            this_week.append(p)
-        elif t and t >= base_start:
-            baseline.append(p)
+    try:
+        raw = ig.media(limit_pages=4)
+    except ig.IGError as e:
+        print(json.dumps({"error": str(e)}, indent=1))
+        sys.exit(1)
 
-    oldest = min([w for w in (when(p) for p in posts) if w], default=now)
-    account_age_days = (now - oldest).days
+    if not raw:
+        print(json.dumps({"error":
+            "No posts came back for @%s, which has media_count=%s. If the "
+            "account really has posted, this is an API problem — do NOT report "
+            "it as a quiet week." % (acct["username"], acct["media_count"])},
+            indent=1))
+        sys.exit(1)
 
-    print(json.dumps({
-        "pulled_at": now.isoformat(timespec="seconds") + "Z",
-        "account": acct,
-        "account_history_days": account_age_days,
-        "enough_history_for_trend": account_age_days >= 60 and len(baseline) >= 8,
-        "this_week": totals(this_week),
-        "baseline": totals(baseline),
+    posts = ig.enrich(raw, payload, with_comments=True)
+    this_week, baseline = ig.split_window(posts, days=WEEK_DAYS)
+
+    oldest = min([d for d in (ig._dt(p.get("posted_at")) for p in posts) if d],
+                 default=datetime.utcnow())
+    history_days = (datetime.utcnow() - oldest).days
+
+    payload.update({
+        "account_history_days": history_days,
+        "enough_history_for_trend":
+            history_days >= TREND_MIN_DAYS and len(baseline) >= TREND_MIN_POSTS,
+        "this_week": ig.totals(this_week),
+        "baseline": ig.totals(baseline),
+        "comment_summary": ig.comment_summary(posts),
         "this_week_posts": this_week,
         "baseline_posts": baseline[:15],
-    }, indent=1, default=str))
+    })
+
+    print(json.dumps(payload, indent=1, default=str))
 
 
 if __name__ == "__main__":
